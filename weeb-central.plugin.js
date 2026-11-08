@@ -11,14 +11,92 @@ const CHAPTER_LANG = "en";
 const ORIGIN = BASE.replace(/^(https?:\/\/[^/]+).*$/i, "$1");
 const WANT = 48; // items returned per popular()/search() call
 
+// Many sites reject requests that don't look like a browser, so send browser headers.
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+let lastError = null;
+let headersRejected = false;
+
+function withHeaders(opts, accept) {
+  const o = Object.assign({}, opts || {});
+  if (headersRejected) {
+    delete o.headers;
+    return o;
+  }
+  o.headers = Object.assign(
+    { "User-Agent": UA, Accept: accept, "Accept-Language": "en-US,en;q=0.9", Referer: ORIGIN + "/" },
+    (opts && opts.headers) || {}
+  );
+  return o;
+}
+
+async function rawHttp(url, opts, accept) {
+  try {
+    return await harbor.http(url, withHeaders(opts, accept));
+  } catch (e) {
+    if (headersRejected) throw e;
+    // If this Harbor build refuses custom headers, retry once without them and remember.
+    headersRejected = true;
+    return await harbor.http(url, withHeaders(opts, accept));
+  }
+}
+
+function blockedReason(body) {
+  const b = String(body || "").slice(0, 4000);
+  if (/just a moment\.\.\.|cf-chl|challenge-platform|cf_chl_opt|Attention Required! \| Cloudflare/i.test(b)) {
+    return "blocked by a Cloudflare check";
+  }
+  return null;
+}
+
 async function getText(url, opts) {
-  const res = await harbor.http(url, Object.assign({ responseType: "text" }, opts || {}));
-  if (!res || !res.ok) throw new Error("http " + (res ? res.status : "?") + " for " + url);
-  return res.body || "";
+  let res;
+  try {
+    res = await rawHttp(url, Object.assign({ responseType: "text" }, opts || {}), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  } catch (e) {
+    lastError = new Error(PLUGIN_NAME + ": network error for " + url + " (" + (e && e.message ? e.message : e) + ")");
+    throw lastError;
+  }
+  const body = res && res.body != null ? String(res.body) : "";
+  const blocked = blockedReason(body);
+  if (!res || !res.ok || blocked) {
+    lastError = new Error(PLUGIN_NAME + ": " + (blocked || "HTTP " + (res ? res.status : "?")) + " for " + url);
+    throw lastError;
+  }
+  return body;
 }
 
 async function getDoc(url, opts) {
   return harbor.parseHtml(await getText(url, opts));
+}
+
+async function fetchJson(url, opts) {
+  let data;
+  try {
+    data = await rawHttp(url, Object.assign({ responseType: "json" }, opts || {}), "application/json, text/plain, */*");
+  } catch (e) {
+    lastError = new Error(PLUGIN_NAME + ": network error for " + url + " (" + (e && e.message ? e.message : e) + ")");
+    throw lastError;
+  }
+  if (data == null) {
+    lastError = new Error(PLUGIN_NAME + ": the site didn't return data for " + url + " (it may be blocked by Cloudflare or down)");
+    throw lastError;
+  }
+  return data;
+}
+
+// Turn "silently empty" results into a visible error message when a request failed.
+function hardenPlugin(p) {
+  for (const m of ["popular", "search", "chapters", "pageUrls"]) {
+    const orig = p[m];
+    if (typeof orig !== "function") continue;
+    p[m] = async function () {
+      lastError = null;
+      const r = await orig.apply(p, arguments);
+      if ((!r || !r.length) && lastError) throw lastError;
+      return r;
+    };
+  }
+  return p;
 }
 
 // Covers and page images MUST be absolute http(s) or Harbor drops them.
@@ -245,8 +323,15 @@ const plugin = {
       .map((a) => {
         const m = (a.attr("href") || "").match(/\/chapters\/([^/?#]+)/);
         if (!m) return null;
-        const spans = a.querySelectorAll("span").map((s) => clean(s.text()));
-        const name = spans.find((t) => /\d/.test(t) && t.length < 80 && !/ago$/i.test(t)) || clean(a.text());
+        // The row also contains "Last Read" badges and dates; take only the chapter name.
+        const junk = (t) => !t || /last read|^new$|ago$/i.test(t) || t.length > 80;
+        const spans = a.querySelectorAll("span").map((s) => clean(s.text())).filter((t) => !junk(t));
+        const named = spans.find((t) => /(chapter|episode|vol|ch\.|ep\.)/i.test(t)) || spans.find((t) => /\d/.test(t));
+        const timeText = clean(a.querySelector("time") && a.querySelector("time").text());
+        const name =
+          named ||
+          clean(a.text().replace(/last read/gi, "").replace(timeText, "")) ||
+          "";
         const parts = splitChapter(name);
         const time = a.querySelector("time");
         return {
@@ -275,4 +360,4 @@ const plugin = {
   },
 };
 
-return plugin;
+return hardenPlugin(plugin);

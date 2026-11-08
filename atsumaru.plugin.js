@@ -13,14 +13,92 @@ const CHAPTER_LANG = "en";
 const ORIGIN = BASE.replace(/^(https?:\/\/[^/]+).*$/i, "$1");
 const WANT = 48; // items returned per popular()/search() call
 
+// Many sites reject requests that don't look like a browser, so send browser headers.
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+let lastError = null;
+let headersRejected = false;
+
+function withHeaders(opts, accept) {
+  const o = Object.assign({}, opts || {});
+  if (headersRejected) {
+    delete o.headers;
+    return o;
+  }
+  o.headers = Object.assign(
+    { "User-Agent": UA, Accept: accept, "Accept-Language": "en-US,en;q=0.9", Referer: ORIGIN + "/" },
+    (opts && opts.headers) || {}
+  );
+  return o;
+}
+
+async function rawHttp(url, opts, accept) {
+  try {
+    return await harbor.http(url, withHeaders(opts, accept));
+  } catch (e) {
+    if (headersRejected) throw e;
+    // If this Harbor build refuses custom headers, retry once without them and remember.
+    headersRejected = true;
+    return await harbor.http(url, withHeaders(opts, accept));
+  }
+}
+
+function blockedReason(body) {
+  const b = String(body || "").slice(0, 4000);
+  if (/just a moment\.\.\.|cf-chl|challenge-platform|cf_chl_opt|Attention Required! \| Cloudflare/i.test(b)) {
+    return "blocked by a Cloudflare check";
+  }
+  return null;
+}
+
 async function getText(url, opts) {
-  const res = await harbor.http(url, Object.assign({ responseType: "text" }, opts || {}));
-  if (!res || !res.ok) throw new Error("http " + (res ? res.status : "?") + " for " + url);
-  return res.body || "";
+  let res;
+  try {
+    res = await rawHttp(url, Object.assign({ responseType: "text" }, opts || {}), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  } catch (e) {
+    lastError = new Error(PLUGIN_NAME + ": network error for " + url + " (" + (e && e.message ? e.message : e) + ")");
+    throw lastError;
+  }
+  const body = res && res.body != null ? String(res.body) : "";
+  const blocked = blockedReason(body);
+  if (!res || !res.ok || blocked) {
+    lastError = new Error(PLUGIN_NAME + ": " + (blocked || "HTTP " + (res ? res.status : "?")) + " for " + url);
+    throw lastError;
+  }
+  return body;
 }
 
 async function getDoc(url, opts) {
   return harbor.parseHtml(await getText(url, opts));
+}
+
+async function fetchJson(url, opts) {
+  let data;
+  try {
+    data = await rawHttp(url, Object.assign({ responseType: "json" }, opts || {}), "application/json, text/plain, */*");
+  } catch (e) {
+    lastError = new Error(PLUGIN_NAME + ": network error for " + url + " (" + (e && e.message ? e.message : e) + ")");
+    throw lastError;
+  }
+  if (data == null) {
+    lastError = new Error(PLUGIN_NAME + ": the site didn't return data for " + url + " (it may be blocked by Cloudflare or down)");
+    throw lastError;
+  }
+  return data;
+}
+
+// Turn "silently empty" results into a visible error message when a request failed.
+function hardenPlugin(p) {
+  for (const m of ["popular", "search", "chapters", "pageUrls"]) {
+    const orig = p[m];
+    if (typeof orig !== "function") continue;
+    p[m] = async function () {
+      lastError = null;
+      const r = await orig.apply(p, arguments);
+      if ((!r || !r.length) && lastError) throw lastError;
+      return r;
+    };
+  }
+  return p;
 }
 
 // Covers and page images MUST be absolute http(s) or Harbor drops them.
@@ -152,9 +230,7 @@ function splitChapter(name) {
 
 
 async function getJson(url) {
-  const data = await harbor.http(url, { responseType: "json" });
-  if (data == null) throw new Error("bad response for " + url);
-  return data;
+  return fetchJson(url);
 }
 
 // Find the first array (searching depth-first) whose items pass the test.
@@ -209,6 +285,60 @@ function isoDate(v) {
   return isNaN(t) ? parseDate(v) : new Date(t).toISOString();
 }
 
+// The API lists every scanlation group's copy of a chapter. Keep one per chapter number,
+// preferring the group that covers the most chapters (so the reading stays consistent),
+// and fall back to other groups only for chapters that group doesn't have.
+function groupOf(c) {
+  for (const k of Object.keys(c)) {
+    if (!/scan|group|team|translat|uploader/i.test(k)) continue;
+    const v = c[k];
+    if (v == null || v === "") continue;
+    if (typeof v === "object") return String(v.id || v.name || v.title || JSON.stringify(v));
+    return String(v);
+  }
+  return "";
+}
+
+function chapterNumber(c) {
+  if (c.number != null && c.number !== "") return String(Number(c.number));
+  const p = splitChapter(c.title || "");
+  return p.chapter != null ? String(Number(p.chapter)) : null;
+}
+
+function pickOnePerChapter(raw) {
+  const coverage = {};
+  for (const c of raw) {
+    const g = groupOf(c);
+    const n = chapterNumber(c);
+    if (n == null) continue;
+    (coverage[g] = coverage[g] || new Set()).add(n);
+  }
+  const rank = {};
+  Object.keys(coverage)
+    .sort((x, y) => coverage[y].size - coverage[x].size)
+    .forEach((g, i) => (rank[g] = i));
+  const best = new Map();
+  const extras = [];
+  for (const c of raw) {
+    const n = chapterNumber(c);
+    if (n == null) {
+      extras.push(c);
+      continue;
+    }
+    const cur = best.get(n);
+    const r = rank[groupOf(c)];
+    if (!cur) best.set(n, c);
+    else {
+      const rc = rank[groupOf(cur)];
+      if (r < rc) best.set(n, c);
+      else if (r === rc && String(c.createdAt || "") > String(cur.createdAt || "")) best.set(n, c);
+    }
+  }
+  const out = Array.from(best.values()).concat(extras);
+  // Newest chapter first, which is how Harbor's own sources list them.
+  return out.sort((x, y) => (Number(chapterNumber(y)) || 0) - (Number(chapterNumber(x)) || 0));
+}
+
 const plugin = {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
@@ -253,7 +383,7 @@ const plugin = {
     // allChapters is the complete list; mangaPage.chapters is capped at 100.
     const data = await getJson(BASE + "/api/manga/allChapters?mangaId=" + encodeURIComponent(id));
     const raw = findArray(data, (c) => c && c.id && (c.number != null || c.title));
-    const list = raw.map((c) => {
+    return pickOnePerChapter(raw).map((c) => {
       const parts = splitChapter(c.title || "");
       const num = c.number != null ? String(c.number) : parts.chapter;
       return {
@@ -267,7 +397,6 @@ const plugin = {
         publishAt: isoDate(c.createdAt || c.publishedAt || c.date),
       };
     });
-    return uniqueBy(list, (c) => c.id);
   },
 
   async pageUrls(chapterId) {
@@ -283,4 +412,4 @@ const plugin = {
   },
 };
 
-return plugin;
+return hardenPlugin(plugin);
